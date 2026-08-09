@@ -5,7 +5,15 @@ This repository contains the source code developed for the thesis:
 **Machine Learning-Based Pre-Departure Fatigue Detection for Bus Drivers**
 
 The study proposes a visual fatigue detection system for bus drivers using facial landmarks, traditional machine learning, dual-branch 2D convolutional neural networks, geometric mouth filtering, and real-time duration-based fatigue judgement.
+## Live Web Dashboard
 
+A web-based Streamlit dashboard was developed to present the experimental results and demonstrate the real-time fatigue monitoring prototype.
+
+**Live Dashboard:**  
+[Open the Bus Driver Fatigue Detection Dashboard](https://bus-driver-fatigue-detection-42tnvkqzbn6skdbp4z74gf.streamlit.app/)
+
+**GitHub Repository:**  
+https://github.com/mawei-research/bus-driver-fatigue-detection
 ## Main Components
 
 ### Eye-State CNN
