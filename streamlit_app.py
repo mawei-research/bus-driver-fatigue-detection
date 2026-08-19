@@ -180,63 +180,66 @@ MOUTH_LEFT, MOUTH_RIGHT, MOUTH_TOP, MOUTH_BOTTOM = 61, 291, 0, 17
 
 
 
-def get_twilio_ice_servers():
+def get_metered_ice_servers():
     """
-    Request short-lived Twilio STUN/TURN credentials and return
-    (ice_servers, status_message). The status message never exposes secrets.
-    """
-    account_sid = None
-    auth_token = None
+    Build Metered TURN ICE servers from Streamlit Secrets.
 
+    Required Streamlit Cloud Secrets:
+      METERED_TURN_USERNAME = "..."
+      METERED_TURN_CREDENTIAL = "..."
+
+    The free Metered TURN plan uses standard.relay.metered.ca.
+    """
     try:
-        # Check the two required Streamlit secrets explicitly.
-        if "TWILIO_ACCOUNT_SID" not in st.secrets:
-            return None, "Missing Streamlit secret: TWILIO_ACCOUNT_SID"
-        if "TWILIO_AUTH_TOKEN" not in st.secrets:
-            return None, "Missing Streamlit secret: TWILIO_AUTH_TOKEN"
+        if "METERED_TURN_USERNAME" not in st.secrets:
+            return None, "Missing Streamlit secret: METERED_TURN_USERNAME"
+        if "METERED_TURN_CREDENTIAL" not in st.secrets:
+            return None, "Missing Streamlit secret: METERED_TURN_CREDENTIAL"
 
-        account_sid = str(st.secrets["TWILIO_ACCOUNT_SID"]).strip()
-        auth_token = str(st.secrets["TWILIO_AUTH_TOKEN"]).strip()
+        username = str(st.secrets["METERED_TURN_USERNAME"]).strip()
+        credential = str(st.secrets["METERED_TURN_CREDENTIAL"]).strip()
 
-        if not account_sid:
-            return None, "TWILIO_ACCOUNT_SID is empty"
-        if not auth_token:
-            return None, "TWILIO_AUTH_TOKEN is empty"
-        if not account_sid.startswith("AC"):
-            return None, "TWILIO_ACCOUNT_SID does not start with AC"
+        if not username:
+            return None, "METERED_TURN_USERNAME is empty"
+        if not credential:
+            return None, "METERED_TURN_CREDENTIAL is empty"
 
-        from twilio.rest import Client
+        ice_servers = [
+            {"urls": "stun:stun.relay.metered.ca:80"},
+            {
+                "urls": "turn:standard.relay.metered.ca:80",
+                "username": username,
+                "credential": credential,
+            },
+            {
+                "urls": "turn:standard.relay.metered.ca:80?transport=tcp",
+                "username": username,
+                "credential": credential,
+            },
+            {
+                "urls": "turn:standard.relay.metered.ca:443",
+                "username": username,
+                "credential": credential,
+            },
+            {
+                "urls": "turn:standard.relay.metered.ca:443?transport=tcp",
+                "username": username,
+                "credential": credential,
+            },
+        ]
 
-        client = Client(account_sid, auth_token)
-
-        # Twilio NTS token. 1 hour is sufficient for the dashboard session.
-        token = client.tokens.create(ttl=3600)
-
-        ice_servers = token.ice_servers
-        if not ice_servers:
-            return None, "Twilio returned no ICE servers"
-
-        return ice_servers, "Twilio STUN/TURN token created successfully"
-
-    except ImportError:
-        return None, "Python package 'twilio' is not installed on Streamlit Cloud"
+        return ice_servers, "Metered TURN credentials loaded successfully"
 
     except Exception as exc:
-        # Sanitize possible credentials before showing the error.
-        message = f"{type(exc).__name__}: {exc}"
-        if account_sid:
-            message = message.replace(account_sid, "[ACCOUNT_SID]")
-        if auth_token:
-            message = message.replace(auth_token, "[AUTH_TOKEN]")
-        return None, message[:500]
+        return None, f"{type(exc).__name__}: {exc}"[:500]
 
 
 def build_rtc_configuration():
-    """Prefer Twilio TURN on cloud; fall back to Google STUN."""
-    twilio_servers, _ = get_twilio_ice_servers()
+    """Prefer Metered TURN on cloud; fall back to Google STUN."""
+    metered_servers, _ = get_metered_ice_servers()
 
-    if twilio_servers:
-        return {"iceServers": twilio_servers}
+    if metered_servers:
+        return {"iceServers": metered_servers}
 
     return {
         "iceServers": [
@@ -588,20 +591,21 @@ elif page == "Real-Time Monitoring":
             "Visual fatigue alerts remain active."
         )
 
-    twilio_servers, twilio_status = get_twilio_ice_servers()
-    if twilio_servers:
+    metered_servers, metered_status = get_metered_ice_servers()
+    if metered_servers:
         st.success(
-            "Cloud camera relay: Twilio STUN/TURN is configured. "
-            f"Status: {twilio_status}"
+            "Cloud camera relay: Metered STUN/TURN is configured. "
+            f"Status: {metered_status}"
         )
     else:
         st.error(
-            "Twilio STUN/TURN is NOT active. "
-            f"Diagnostic: {twilio_status}"
+            "Metered STUN/TURN is NOT active. "
+            f"Diagnostic: {metered_status}"
         )
         st.warning(
-            "The app will temporarily fall back to Google STUN, "
-            "but the cloud camera may fail to connect on restrictive networks."
+            "The app will temporarily fall back to Google STUN. "
+            "For Streamlit Community Cloud, add METERED_TURN_USERNAME and "
+            "METERED_TURN_CREDENTIAL in the app Secrets."
         )
 
     if not EYE_MODEL_PATH.exists() or not MOUTH_MODEL_PATH.exists():
