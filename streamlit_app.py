@@ -165,12 +165,74 @@ ALARM_SOUND_REPEAT_SECONDS = 3.0
 EYE_EXPANSION = 0.25
 MOUTH_EXPANSION = 0.25
 
+# Real-time optimisation settings.
+FRAME_STEP = 2
+DISPLAY_WIDTH = 640
+DISPLAY_HEIGHT = 480
+CAMERA_IDEAL_FPS = 24
+
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308,
          324, 318, 402, 317, 14, 87, 178, 88, 95, 78, 191, 80, 81, 82,
          13, 312, 311, 310, 415]
 MOUTH_LEFT, MOUTH_RIGHT, MOUTH_TOP, MOUTH_BOTTOM = 61, 291, 0, 17
+
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_twilio_ice_servers():
+    """Request short-lived Twilio STUN/TURN credentials if Secrets are configured."""
+    try:
+        from twilio.rest import Client
+
+        account_sid = st.secrets["TWILIO_ACCOUNT_SID"]
+        auth_token = st.secrets["TWILIO_AUTH_TOKEN"]
+
+        client = Client(account_sid, auth_token)
+        token = client.tokens.create(ttl=3600)
+        return token.ice_servers
+    except Exception:
+        return None
+
+
+def build_rtc_configuration():
+    """Prefer Twilio TURN on cloud; fall back to Google STUN."""
+    twilio_servers = get_twilio_ice_servers()
+    if twilio_servers:
+        return {"iceServers": twilio_servers}
+
+    return {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]}
+        ]
+    }
+
+
+def resize_with_letterbox(frame, target_width=DISPLAY_WIDTH, target_height=DISPLAY_HEIGHT):
+    """Resize without distorting facial geometry and pad to a fixed processing size."""
+    if frame is None or frame.size == 0:
+        return frame
+
+    h, w = frame.shape[:2]
+    if h <= 0 or w <= 0:
+        return frame
+
+    scale = min(target_width / float(w), target_height / float(h))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    resized = cv2.resize(
+        frame,
+        (new_w, new_h),
+        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
+    )
+
+    canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    x0 = (target_width - new_w) // 2
+    y0 = (target_height - new_h) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
 
 
 def get_square_box(landmarks, indices, frame_width, frame_height, expansion_ratio):
@@ -261,9 +323,9 @@ def draw_hud_panel(
     yawn_duration,
     alarm_text,
 ):
-    """Attach a separate right-side HUD so diagnostic text never covers the face."""
+    """Attach a compact side HUD that fits the optimized 640x480 live stream."""
     h, w = img.shape[:2]
-    panel_w = max(330, int(w * 0.42))
+    panel_w = 320
     panel = np.full((h, panel_w, 3), (29, 32, 40), dtype=np.uint8)
 
     white = (242, 242, 242)
@@ -274,84 +336,86 @@ def draw_hud_panel(
     cyan = (230, 190, 70)
     divider = (65, 70, 82)
 
-    def put(text, x, y, scale=0.58, color=white, thickness=1):
-        cv2.putText(panel, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    scale, color, thickness, cv2.LINE_AA)
+    def put(value, x, y, scale=0.50, color=white, thickness=1):
+        cv2.putText(
+            panel, str(value), (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+            scale, color, thickness, cv2.LINE_AA
+        )
 
-    # Header
-    put('LIVE FATIGUE MONITOR', 24, 42, 0.72, white, 2)
-    put('Dual 2D-CNN + geometric filter', 24, 70, 0.44, muted, 1)
-    cv2.line(panel, (24, 88), (panel_w - 24, 88), divider, 1, cv2.LINE_AA)
+    put("LIVE FATIGUE MONITOR", 18, 30, 0.60, white, 2)
+    put("Dual 2D-CNN | FrameStep 2", 18, 52, 0.40, muted, 1)
+    cv2.line(panel, (18, 65), (panel_w - 18, 65), divider, 1, cv2.LINE_AA)
 
-    # Main states
     face_color = green if face_detected else red
-    eye_color = red if eye_status == 'CLOSED' else (green if eye_status == 'OPEN' else muted)
-    mouth_color = orange if mouth_status == 'YAWNING' else (cyan if 'SMILE' in mouth_status else green if mouth_status == 'NORMAL' else muted)
+    eye_color = red if eye_status == "CLOSED" else (green if eye_status == "OPEN" else muted)
+    mouth_color = (
+        orange if mouth_status == "YAWNING"
+        else cyan if "SMILE" in mouth_status
+        else green if mouth_status == "NORMAL"
+        else muted
+    )
 
-    put('FACE', 24, 124, 0.48, muted, 1)
-    put('DETECTED' if face_detected else 'NOT DETECTED', 132, 124, 0.60, face_color, 2)
-    put('EYES', 24, 160, 0.48, muted, 1)
-    put(eye_status, 132, 160, 0.60, eye_color, 2)
-    put('MOUTH', 24, 196, 0.48, muted, 1)
-    put(mouth_status, 132, 196, 0.56, mouth_color, 2)
+    put("FACE", 18, 92, 0.42, muted, 1)
+    put("DETECTED" if face_detected else "NOT DETECTED", 110, 92, 0.50, face_color, 2)
+    put("EYES", 18, 120, 0.42, muted, 1)
+    put(eye_status, 110, 120, 0.50, eye_color, 2)
+    put("MOUTH", 18, 148, 0.42, muted, 1)
+    put(mouth_status, 110, 148, 0.46, mouth_color, 2)
 
-    cv2.line(panel, (24, 216), (panel_w - 24, 216), divider, 1, cv2.LINE_AA)
+    cv2.line(panel, (18, 162), (panel_w - 18, 162), divider, 1, cv2.LINE_AA)
 
-    # Probabilities
-    lp = '--' if left_prob is None else f'{left_prob:.3f}'
-    rp = '--' if right_prob is None else f'{right_prob:.3f}'
-    yp = '--' if yawn_prob is None else f'{yawn_prob:.3f}'
-    mr = '--' if mouth_ratio is None else f'{mouth_ratio:.3f}'
+    lp = "--" if left_prob is None else f"{left_prob:.3f}"
+    rp = "--" if right_prob is None else f"{right_prob:.3f}"
+    yp = "--" if yawn_prob is None else f"{yawn_prob:.3f}"
+    mr = "--" if mouth_ratio is None else f"{mouth_ratio:.3f}"
 
-    put('CNN OUTPUTS', 24, 248, 0.48, muted, 1)
-    put(f'Left eye open     {lp}', 24, 282, 0.50, white, 1)
-    put(f'Right eye open    {rp}', 24, 312, 0.50, white, 1)
-    put(f'Yawn probability  {yp}', 24, 342, 0.50, white, 1)
-    put(f'Mouth ratio       {mr}', 24, 372, 0.50, white, 1)
+    put("CNN OUTPUTS", 18, 184, 0.42, muted, 1)
+    put(f"Left eye open      {lp}", 18, 208, 0.43, white, 1)
+    put(f"Right eye open     {rp}", 18, 232, 0.43, white, 1)
+    put(f"Yawn probability   {yp}", 18, 256, 0.43, white, 1)
+    put(f"Mouth ratio        {mr}", 18, 280, 0.43, white, 1)
 
-    cv2.line(panel, (24, 392), (panel_w - 24, 392), divider, 1, cv2.LINE_AA)
+    cv2.line(panel, (18, 294), (panel_w - 18, 294), divider, 1, cv2.LINE_AA)
 
-    # Timers + progress bars
-    put('DURATION', 24, 424, 0.48, muted, 1)
-    put(f'Eye closure  {closed_duration:4.2f} s', 24, 456, 0.50, white, 1)
-    put(f'Yawn         {yawn_duration:4.2f} s', 24, 510, 0.50, white, 1)
+    put("ACTUAL-TIME DURATION", 18, 316, 0.42, muted, 1)
+    put(f"Eye closure  {closed_duration:4.2f} s", 18, 340, 0.44, white, 1)
+    put(f"Yawn         {yawn_duration:4.2f} s", 18, 382, 0.44, white, 1)
 
-    bar_x1, bar_x2 = 24, panel_w - 24
+    bar_x1, bar_x2 = 18, panel_w - 18
     bar_w = max(1, bar_x2 - bar_x1)
     for y, value, color in [
-        (468, closed_duration, red),
-        (522, yawn_duration, orange),
+        (348, closed_duration, red),
+        (390, yawn_duration, orange),
     ]:
-        cv2.rectangle(panel, (bar_x1, y), (bar_x2, y + 9), (55, 59, 69), -1)
+        cv2.rectangle(panel, (bar_x1, y), (bar_x2, y + 7), (55, 59, 69), -1)
         frac = min(max(value / ALARM_SECONDS, 0.0), 1.0)
         fill_x = bar_x1 + int(bar_w * frac)
         if fill_x > bar_x1:
-            cv2.rectangle(panel, (bar_x1, y), (fill_x, y + 9), color, -1)
+            cv2.rectangle(panel, (bar_x1, y), (fill_x, y + 7), color, -1)
 
-    # Bottom status card. Position relative to frame height to avoid clipping.
-    card_h = 70
-    card_y1 = max(545, h - card_h - 18)
-    card_y2 = h - 18
+    card_y1 = max(410, h - 58)
+    card_y2 = h - 10
     if alarm_text:
         card_color = (45, 45, 185)
-        status_line1 = 'FATIGUE ALERT'
-        status_line2 = 'EYE CLOSURE > 2.0 s' if 'EYE' in alarm_text else 'YAWNING > 2.0 s'
-        cv2.rectangle(img, (0, 0), (w - 1, h - 1), red, 5)
+        status_line1 = "FATIGUE ALERT"
+        status_line2 = "EYE CLOSURE >= 2.0 s" if "EYE" in alarm_text else "YAWNING >= 2.0 s"
+        cv2.rectangle(img, (0, 0), (w - 1, h - 1), red, 4)
     else:
         card_color = (42, 110, 70)
-        status_line1 = 'STATUS: NORMAL'
-        status_line2 = 'Monitoring active'
+        status_line1 = "STATUS: NORMAL"
+        status_line2 = "Monitoring active"
 
-    cv2.rectangle(panel, (18, card_y1), (panel_w - 18, card_y2), card_color, -1)
-    put(status_line1, 34, card_y1 + 29, 0.60, white, 2)
-    put(status_line2, 34, card_y1 + 54, 0.43, white, 1)
+    cv2.rectangle(panel, (14, card_y1), (panel_w - 14, card_y2), card_color, -1)
+    put(status_line1, 26, card_y1 + 21, 0.50, white, 2)
+    put(status_line2, 26, min(card_y1 + 42, card_y2 - 4), 0.36, white, 1)
 
-    # Minimal on-video indicator only.
-    badge_text = 'NORMAL' if not alarm_text else 'FATIGUE ALERT'
+    badge_text = "NORMAL" if not alarm_text else "FATIGUE ALERT"
     badge_color = (45, 145, 75) if not alarm_text else (45, 45, 200)
-    cv2.rectangle(img, (14, 14), (210, 52), badge_color, -1)
-    cv2.putText(img, badge_text, (28, 41), cv2.FONT_HERSHEY_SIMPLEX,
-                0.62, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.rectangle(img, (12, 12), (200, 46), badge_color, -1)
+    cv2.putText(
+        img, badge_text, (24, 36), cv2.FONT_HERSHEY_SIMPLEX,
+        0.56, (255, 255, 255), 2, cv2.LINE_AA
+    )
 
     return np.hstack([img, panel])
 
@@ -395,12 +459,27 @@ def start_alarm_sound(alarm_kind="FATIGUE"):
 @st.cache_resource(show_spinner="Loading eye and mouth CNN models...")
 def load_realtime_models():
     import tensorflow as tf
+
     if not EYE_MODEL_PATH.exists():
         raise FileNotFoundError(f"Eye model not found: {EYE_MODEL_PATH}")
     if not MOUTH_MODEL_PATH.exists():
         raise FileNotFoundError(f"Mouth model not found: {MOUTH_MODEL_PATH}")
+
     eye_model = tf.keras.models.load_model(str(EYE_MODEL_PATH), compile=False)
     mouth_model = tf.keras.models.load_model(str(MOUTH_MODEL_PATH), compile=False)
+
+    try:
+        eye_model(
+            np.zeros((2, IMAGE_SIZE, IMAGE_SIZE, 1), dtype=np.float32),
+            training=False,
+        )
+        mouth_model(
+            np.zeros((1, IMAGE_SIZE, IMAGE_SIZE, 1), dtype=np.float32),
+            training=False,
+        )
+    except Exception:
+        pass
+
     return eye_model, mouth_model
 
 
@@ -444,32 +523,44 @@ if page == "Overview":
 elif page == "Real-Time Monitoring":
     st.subheader("Real-Time Fatigue Monitoring")
     st.markdown(
-        "Click **START** below and allow camera access in the browser. The video will "
-        "show a clean camera view with ROI boxes and a separate status panel for eye state, "
-        "mouth state, CNN probabilities, timers, and fatigue warnings."
+        "Click **START** below and allow camera access in the browser. "
+        "This optimized prototype uses **FrameStep = 2**, 640x480 processing, "
+        "MediaPipe Face Mesh, the two trained 2D-CNN models, geometric filtering, "
+        "and actual-time duration judgement."
     )
 
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Eye Threshold", "0.50")
-    p2.metric("Yawn Threshold", "0.50")
-    p3.metric("Mouth Ratio Filter", "≤ 1.50")
-    p4.metric("Alarm Duration", "2.0 s")
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric("FrameStep", "2")
+    p2.metric("Eye Threshold", "0.50")
+    p3.metric("Yawn Threshold", "0.50")
+    p4.metric("Mouth Ratio", "<= 1.50")
+    p5.metric("Alarm Duration", "2.0 s")
 
-    sound_col1, sound_col2 = st.columns([3, 1])
-    with sound_col1:
-        if WINDOWS_SOUND_AVAILABLE:
+    if WINDOWS_SOUND_AVAILABLE:
+        sound_col1, sound_col2 = st.columns([3, 1])
+        with sound_col1:
             st.success(
-                "🔊 Alarm sound is enabled. A short alert pattern will play when "
-                "prolonged eye closure or yawning reaches 2.0 seconds."
+                "Local Windows alarm sound is enabled. "
+                "Visual alerts remain active on all deployments."
             )
-        else:
-            st.info(
-                "🔇 Local Windows alarm sound is unavailable on this operating system. "
-                "Visual fatigue alerts will still work."
-            )
-    with sound_col2:
-        if WINDOWS_SOUND_AVAILABLE and st.button("🔊 Test alarm sound"):
-            start_alarm_sound("FATIGUE")
+        with sound_col2:
+            if st.button("Test alarm sound"):
+                start_alarm_sound("FATIGUE")
+    else:
+        st.info(
+            "Server-side Windows alarm sound is unavailable on this host. "
+            "Visual fatigue alerts remain active."
+        )
+
+    twilio_available = bool(get_twilio_ice_servers())
+    if twilio_available:
+        st.success("Cloud camera relay: Twilio STUN/TURN is configured.")
+    else:
+        st.warning(
+            "Cloud camera relay: using Google STUN fallback. "
+            "For Streamlit Community Cloud, add TWILIO_ACCOUNT_SID and "
+            "TWILIO_AUTH_TOKEN in the app Secrets if the camera cannot connect."
+        )
 
     if not EYE_MODEL_PATH.exists() or not MOUTH_MODEL_PATH.exists():
         st.error(
@@ -480,7 +571,7 @@ elif page == "Real-Time Monitoring":
         )
     else:
         try:
-            from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+            from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
             import av
             import mediapipe as mp
 
@@ -491,131 +582,230 @@ elif page == "Real-Time Monitoring":
                     self.face_mesh = mp.solutions.face_mesh.FaceMesh(
                         static_image_mode=False,
                         max_num_faces=1,
-                        refine_landmarks=True,
+                        refine_landmarks=False,
                         min_detection_confidence=0.50,
                         min_tracking_confidence=0.50,
                     )
+
+                    self.frame_index = 0
                     self.eye_closed_start = None
                     self.yawn_start = None
                     self.alarm_active = False
                     self.last_alarm_sound_time = 0.0
                     self.last_alarm_kind = None
 
-                def recv(self, frame):
-                    img = frame.to_ndarray(format="bgr24")
-                    img = cv2.flip(img, 1)
-                    h, w = img.shape[:2]
-                    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    result = self.face_mesh.process(rgb)
-                    now = time.monotonic()
+                    self.face_detected = False
+                    self.left_prob = None
+                    self.right_prob = None
+                    self.yawn_prob = None
+                    self.mouth_ratio = None
+                    self.eye_status = "Unknown"
+                    self.mouth_status = "Unknown"
+                    self.left_box = None
+                    self.right_box = None
+                    self.mouth_box = None
 
-                    face_detected = bool(result.multi_face_landmarks)
-                    left_prob = right_prob = yawn_prob = None
-                    mouth_ratio = None
+                @staticmethod
+                def _run_model(model, batch):
+                    output = model(batch, training=False)
+                    if hasattr(output, "numpy"):
+                        output = output.numpy()
+                    return np.asarray(output).reshape(-1)
+
+                def _reset_detection_state(self):
+                    self.face_detected = False
+                    self.left_prob = None
+                    self.right_prob = None
+                    self.yawn_prob = None
+                    self.mouth_ratio = None
+                    self.eye_status = "Unknown"
+                    self.mouth_status = "Unknown"
+                    self.left_box = None
+                    self.right_box = None
+                    self.mouth_box = None
+                    self.eye_closed_start = None
+                    self.yawn_start = None
+
+                def _durations(self, now):
                     closed_duration = 0.0
                     yawn_duration = 0.0
-                    eye_status = "Unknown"
-                    mouth_status = "Unknown"
-                    alarm_text = None
 
-                    if face_detected:
-                        lm = result.multi_face_landmarks[0]
-                        left_box = get_square_box(lm, LEFT_EYE, w, h, EYE_EXPANSION)
-                        right_box = get_square_box(lm, RIGHT_EYE, w, h, EYE_EXPANSION)
-                        mouth_box = get_square_box(lm, MOUTH, w, h, MOUTH_EXPANSION)
+                    if self.eye_status == "CLOSED" and self.eye_closed_start is not None:
+                        closed_duration = max(0.0, now - self.eye_closed_start)
 
-                        left_roi = preprocess_roi(img, left_box)
-                        right_roi = preprocess_roi(img, right_box)
-                        mouth_roi = preprocess_roi(img, mouth_box)
+                    if self.mouth_status == "YAWNING" and self.yawn_start is not None:
+                        yawn_duration = max(0.0, now - self.yawn_start)
 
-                        if left_roi is not None and right_roi is not None:
-                            eye_batch = np.stack([left_roi, right_roi], axis=0)
-                            preds = eye_model.predict(eye_batch, verbose=0).reshape(-1)
-                            if len(preds) >= 2:
-                                left_prob, right_prob = float(preds[0]), float(preds[1])
-                                eyes_closed = left_prob < EYE_THRESHOLD and right_prob < EYE_THRESHOLD
-                                if eyes_closed:
-                                    eye_status = "CLOSED"
-                                    if self.eye_closed_start is None:
-                                        self.eye_closed_start = now
-                                    closed_duration = now - self.eye_closed_start
+                    return closed_duration, yawn_duration
+
+                def recv(self, frame):
+                    raw = frame.to_ndarray(format="bgr24")
+                    raw = cv2.flip(raw, 1)
+                    img = resize_with_letterbox(raw)
+
+                    h, w = img.shape[:2]
+                    now = time.monotonic()
+
+                    self.frame_index += 1
+                    do_inference = (self.frame_index % FRAME_STEP) == 1
+
+                    if do_inference:
+                        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        result = self.face_mesh.process(rgb)
+                        self.face_detected = bool(result.multi_face_landmarks)
+
+                        if self.face_detected:
+                            lm = result.multi_face_landmarks[0]
+
+                            self.left_box = get_square_box(
+                                lm, LEFT_EYE, w, h, EYE_EXPANSION
+                            )
+                            self.right_box = get_square_box(
+                                lm, RIGHT_EYE, w, h, EYE_EXPANSION
+                            )
+                            self.mouth_box = get_square_box(
+                                lm, MOUTH, w, h, MOUTH_EXPANSION
+                            )
+
+                            left_roi = preprocess_roi(img, self.left_box)
+                            right_roi = preprocess_roi(img, self.right_box)
+                            mouth_roi = preprocess_roi(img, self.mouth_box)
+
+                            if left_roi is not None and right_roi is not None:
+                                eye_batch = np.stack([left_roi, right_roi], axis=0)
+                                preds = self._run_model(eye_model, eye_batch)
+
+                                if len(preds) >= 2:
+                                    self.left_prob = float(preds[0])
+                                    self.right_prob = float(preds[1])
+
+                                    eyes_closed = (
+                                        self.left_prob < EYE_THRESHOLD
+                                        and self.right_prob < EYE_THRESHOLD
+                                    )
+
+                                    if eyes_closed:
+                                        self.eye_status = "CLOSED"
+                                        if self.eye_closed_start is None:
+                                            self.eye_closed_start = now
+                                    else:
+                                        self.eye_status = "OPEN"
+                                        self.eye_closed_start = None
                                 else:
-                                    eye_status = "OPEN"
+                                    self.left_prob = None
+                                    self.right_prob = None
+                                    self.eye_status = "Unknown"
                                     self.eye_closed_start = None
                             else:
+                                self.left_prob = None
+                                self.right_prob = None
+                                self.eye_status = "Unknown"
                                 self.eye_closed_start = None
-                        else:
-                            self.eye_closed_start = None
 
-                        mouth_ratio = get_mouth_ratio(lm, w, h)
-                        if mouth_roi is not None:
-                            pred = mouth_model.predict(np.expand_dims(mouth_roi, axis=0), verbose=0).reshape(-1)
-                            if len(pred):
-                                yawn_prob = float(pred[0])
-                                likely_smile = mouth_ratio is not None and mouth_ratio > SMILE_RATIO_THRESHOLD
-                                yawning = yawn_prob >= MOUTH_THRESHOLD and not likely_smile
-                                if yawning:
-                                    mouth_status = "YAWNING"
-                                    if self.yawn_start is None:
-                                        self.yawn_start = now
-                                    yawn_duration = now - self.yawn_start
-                                elif likely_smile and yawn_prob >= MOUTH_THRESHOLD:
-                                    mouth_status = "SMILE / IGNORED"
-                                    self.yawn_start = None
+                            self.mouth_ratio = get_mouth_ratio(lm, w, h)
+
+                            if mouth_roi is not None:
+                                pred = self._run_model(
+                                    mouth_model,
+                                    np.expand_dims(mouth_roi, axis=0),
+                                )
+
+                                if len(pred):
+                                    self.yawn_prob = float(pred[0])
+
+                                    likely_smile = (
+                                        self.mouth_ratio is not None
+                                        and self.mouth_ratio > SMILE_RATIO_THRESHOLD
+                                    )
+
+                                    yawning = (
+                                        self.yawn_prob >= MOUTH_THRESHOLD
+                                        and not likely_smile
+                                    )
+
+                                    if yawning:
+                                        self.mouth_status = "YAWNING"
+                                        if self.yawn_start is None:
+                                            self.yawn_start = now
+                                    elif (
+                                        likely_smile
+                                        and self.yawn_prob >= MOUTH_THRESHOLD
+                                    ):
+                                        self.mouth_status = "SMILE / IGNORED"
+                                        self.yawn_start = None
+                                    else:
+                                        self.mouth_status = "NORMAL"
+                                        self.yawn_start = None
                                 else:
-                                    mouth_status = "NORMAL"
+                                    self.yawn_prob = None
+                                    self.mouth_status = "Unknown"
                                     self.yawn_start = None
                             else:
+                                self.yawn_prob = None
+                                self.mouth_status = "Unknown"
                                 self.yawn_start = None
                         else:
-                            self.yawn_start = None
+                            self._reset_detection_state()
 
-                        draw_box(img, left_box, (0, 255, 0) if eye_status == "OPEN" else (0, 0, 255), "Left Eye")
-                        draw_box(img, right_box, (0, 255, 0) if eye_status == "OPEN" else (0, 0, 255), "Right Eye")
-                        draw_box(img, mouth_box, (0, 165, 255) if mouth_status == "YAWNING" else (255, 255, 0), "Mouth")
+                    closed_duration, yawn_duration = self._durations(now)
 
-                        alarm_kind = None
-                        if closed_duration >= ALARM_SECONDS:
-                            alarm_text = "WARNING: PROLONGED EYE CLOSURE"
-                            alarm_kind = "EYE"
-                        if yawn_duration >= ALARM_SECONDS:
-                            alarm_text = "WARNING: PROLONGED YAWNING"
-                            alarm_kind = "YAWN"
+                    if self.face_detected:
+                        draw_box(
+                            img,
+                            self.left_box,
+                            (0, 255, 0) if self.eye_status == "OPEN" else (0, 0, 255),
+                        )
+                        draw_box(
+                            img,
+                            self.right_box,
+                            (0, 255, 0) if self.eye_status == "OPEN" else (0, 0, 255),
+                        )
+                        draw_box(
+                            img,
+                            self.mouth_box,
+                            (0, 165, 255)
+                            if self.mouth_status == "YAWNING"
+                            else (255, 255, 0),
+                        )
 
-                        # Sound the alarm when fatigue is first confirmed. While the
-                        # same fatigue condition persists, repeat only every few seconds
-                        # so the system remains noticeable without producing a constant tone.
-                        if alarm_text:
-                            should_sound = (
-                                not self.alarm_active
-                                or self.last_alarm_kind != alarm_kind
-                                or (now - self.last_alarm_sound_time) >= ALARM_SOUND_REPEAT_SECONDS
-                            )
-                            if should_sound:
-                                start_alarm_sound(alarm_kind or "FATIGUE")
-                                self.last_alarm_sound_time = now
-                                self.last_alarm_kind = alarm_kind
-                            self.alarm_active = True
-                        else:
-                            self.alarm_active = False
-                            self.last_alarm_kind = None
+                    alarm_text = None
+                    alarm_kind = None
+
+                    if closed_duration >= ALARM_SECONDS:
+                        alarm_text = "WARNING: PROLONGED EYE CLOSURE"
+                        alarm_kind = "EYE"
+
+                    if yawn_duration >= ALARM_SECONDS:
+                        alarm_text = "WARNING: PROLONGED YAWNING"
+                        alarm_kind = "YAWN"
+
+                    if alarm_text:
+                        should_sound = (
+                            not self.alarm_active
+                            or self.last_alarm_kind != alarm_kind
+                            or (now - self.last_alarm_sound_time)
+                            >= ALARM_SOUND_REPEAT_SECONDS
+                        )
+
+                        if should_sound:
+                            start_alarm_sound(alarm_kind or "FATIGUE")
+                            self.last_alarm_sound_time = now
+                            self.last_alarm_kind = alarm_kind
+
+                        self.alarm_active = True
                     else:
-                        self.eye_closed_start = None
-                        self.yawn_start = None
                         self.alarm_active = False
                         self.last_alarm_kind = None
 
-                    # Clean layout: keep the driver image clear and place all
-                    # diagnostics in a dedicated right-side HUD panel.
                     display = draw_hud_panel(
                         img,
-                        face_detected,
-                        eye_status,
-                        mouth_status,
-                        left_prob,
-                        right_prob,
-                        yawn_prob,
-                        mouth_ratio,
+                        self.face_detected,
+                        self.eye_status,
+                        self.mouth_status,
+                        self.left_prob,
+                        self.right_prob,
+                        self.yawn_prob,
+                        self.mouth_ratio,
                         closed_duration,
                         yawn_duration,
                         alarm_text,
@@ -626,20 +816,30 @@ elif page == "Real-Time Monitoring":
             webrtc_streamer(
                 key="fatigue-monitor",
                 video_processor_factory=FatigueVideoProcessor,
-                media_stream_constraints={"video": True, "audio": False},
-                rtc_configuration=RTCConfiguration({
-                    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-                }),
+                media_stream_constraints={
+                    "video": {
+                        "width": {"ideal": DISPLAY_WIDTH},
+                        "height": {"ideal": DISPLAY_HEIGHT},
+                        "frameRate": {"ideal": CAMERA_IDEAL_FPS, "max": 30},
+                    },
+                    "audio": False,
+                },
+                rtc_configuration=build_rtc_configuration(),
                 async_processing=True,
             )
+
             st.caption(
-                "Camera frames are processed for the live prototype. No webcam recording is saved. "
-                "On local Windows runs, the alarm sound is played by the computer hosting Streamlit."
+                "Camera frames are processed in memory for the live prototype; "
+                "no webcam recording is saved. MediaPipe/CNN inference runs every "
+                "other frame (FrameStep = 2), while the 2.0-second decision uses "
+                "actual elapsed time."
             )
+
         except ImportError as exc:
             st.error(
-                "Real-time browser camera support is not installed yet. In the PyCharm Terminal run:\n\n"
-                "`pip install streamlit-webrtc av`\n\n"
+                "Real-time browser camera support is not installed. "
+                "Ensure requirements.txt contains streamlit-webrtc, av, "
+                "mediapipe, and twilio.\n\n"
                 f"Missing package details: {exc}"
             )
         except Exception as exc:
