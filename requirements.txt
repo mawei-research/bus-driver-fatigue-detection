@@ -13,3 +13,4 @@ pandas==2.3.3
 
 opencv-contrib-python==4.8.1.78
 graphviz==0.21
+twilio
