@@ -180,25 +180,61 @@ MOUTH_LEFT, MOUTH_RIGHT, MOUTH_TOP, MOUTH_BOTTOM = 61, 291, 0, 17
 
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_twilio_ice_servers():
-    """Request short-lived Twilio STUN/TURN credentials if Secrets are configured."""
+    """
+    Request short-lived Twilio STUN/TURN credentials and return
+    (ice_servers, status_message). The status message never exposes secrets.
+    """
+    account_sid = None
+    auth_token = None
+
     try:
+        # Check the two required Streamlit secrets explicitly.
+        if "TWILIO_ACCOUNT_SID" not in st.secrets:
+            return None, "Missing Streamlit secret: TWILIO_ACCOUNT_SID"
+        if "TWILIO_AUTH_TOKEN" not in st.secrets:
+            return None, "Missing Streamlit secret: TWILIO_AUTH_TOKEN"
+
+        account_sid = str(st.secrets["TWILIO_ACCOUNT_SID"]).strip()
+        auth_token = str(st.secrets["TWILIO_AUTH_TOKEN"]).strip()
+
+        if not account_sid:
+            return None, "TWILIO_ACCOUNT_SID is empty"
+        if not auth_token:
+            return None, "TWILIO_AUTH_TOKEN is empty"
+        if not account_sid.startswith("AC"):
+            return None, "TWILIO_ACCOUNT_SID does not start with AC"
+
         from twilio.rest import Client
 
-        account_sid = st.secrets["TWILIO_ACCOUNT_SID"]
-        auth_token = st.secrets["TWILIO_AUTH_TOKEN"]
-
         client = Client(account_sid, auth_token)
+
+        # Twilio NTS token. 1 hour is sufficient for the dashboard session.
         token = client.tokens.create(ttl=3600)
-        return token.ice_servers
-    except Exception:
-        return None
+
+        ice_servers = token.ice_servers
+        if not ice_servers:
+            return None, "Twilio returned no ICE servers"
+
+        return ice_servers, "Twilio STUN/TURN token created successfully"
+
+    except ImportError:
+        return None, "Python package 'twilio' is not installed on Streamlit Cloud"
+
+    except Exception as exc:
+        # Sanitize possible credentials before showing the error.
+        message = f"{type(exc).__name__}: {exc}"
+        if account_sid:
+            message = message.replace(account_sid, "[ACCOUNT_SID]")
+        if auth_token:
+            message = message.replace(auth_token, "[AUTH_TOKEN]")
+        return None, message[:500]
 
 
 def build_rtc_configuration():
     """Prefer Twilio TURN on cloud; fall back to Google STUN."""
-    twilio_servers = get_twilio_ice_servers()
+    twilio_servers, _ = get_twilio_ice_servers()
+
     if twilio_servers:
         return {"iceServers": twilio_servers}
 
@@ -552,14 +588,20 @@ elif page == "Real-Time Monitoring":
             "Visual fatigue alerts remain active."
         )
 
-    twilio_available = bool(get_twilio_ice_servers())
-    if twilio_available:
-        st.success("Cloud camera relay: Twilio STUN/TURN is configured.")
+    twilio_servers, twilio_status = get_twilio_ice_servers()
+    if twilio_servers:
+        st.success(
+            "Cloud camera relay: Twilio STUN/TURN is configured. "
+            f"Status: {twilio_status}"
+        )
     else:
+        st.error(
+            "Twilio STUN/TURN is NOT active. "
+            f"Diagnostic: {twilio_status}"
+        )
         st.warning(
-            "Cloud camera relay: using Google STUN fallback. "
-            "For Streamlit Community Cloud, add TWILIO_ACCOUNT_SID and "
-            "TWILIO_AUTH_TOKEN in the app Secrets if the camera cannot connect."
+            "The app will temporarily fall back to Google STUN, "
+            "but the cloud camera may fail to connect on restrictive networks."
         )
 
     if not EYE_MODEL_PATH.exists() or not MOUTH_MODEL_PATH.exists():
