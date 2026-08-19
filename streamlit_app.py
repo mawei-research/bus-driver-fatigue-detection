@@ -171,6 +171,13 @@ DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
 CAMERA_IDEAL_FPS = 24
 
+# Browser alarm audio settings.
+# The alarm is sent back through the same WebRTC connection so it plays
+# on the visitor's computer/phone rather than on the Streamlit Cloud host.
+ALARM_AUDIO_SAMPLE_RATE = 16000
+ALARM_AUDIO_PTIME = 0.02
+ALARM_AUDIO_VOLUME = 0.42
+
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308,
@@ -178,6 +185,52 @@ MOUTH = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308,
          13, 312, 311, 310, 415]
 MOUTH_LEFT, MOUTH_RIGHT, MOUTH_TOP, MOUTH_BOTTOM = 61, 291, 0, 17
 
+
+
+
+def _tone_pcm(frequency_hz, duration_s, sample_rate=ALARM_AUDIO_SAMPLE_RATE,
+              volume=ALARM_AUDIO_VOLUME):
+    """Generate mono signed-16-bit PCM for one alarm tone."""
+    sample_count = max(1, int(round(duration_s * sample_rate)))
+    t = np.arange(sample_count, dtype=np.float32) / float(sample_rate)
+    wave = np.sin(2.0 * np.pi * float(frequency_hz) * t)
+
+    # Short fade-in/out to avoid clicks.
+    fade_count = min(int(sample_rate * 0.015), sample_count // 2)
+    if fade_count > 0:
+        fade = np.linspace(0.0, 1.0, fade_count, dtype=np.float32)
+        wave[:fade_count] *= fade
+        wave[-fade_count:] *= fade[::-1]
+
+    pcm = np.clip(wave * (32767.0 * volume), -32768, 32767)
+    return pcm.astype(np.int16)
+
+
+def _silence_pcm(duration_s, sample_rate=ALARM_AUDIO_SAMPLE_RATE):
+    return np.zeros(max(1, int(round(duration_s * sample_rate))), dtype=np.int16)
+
+
+def make_browser_alarm_pcm(alarm_kind="FATIGUE"):
+    """
+    Build a short alarm pattern as mono int16 PCM.
+    The returned samples are pushed into streamlit-webrtc's PCM source track.
+    """
+    if alarm_kind == "EYE":
+        pattern = [(1850, 0.22), (1150, 0.18), (1850, 0.24)]
+    elif alarm_kind == "YAWN":
+        pattern = [(1450, 0.18), (1450, 0.18), (1450, 0.28)]
+    else:
+        pattern = [(1650, 0.22), (1050, 0.18), (1650, 0.30)]
+
+    chunks = []
+    for index, (frequency_hz, duration_s) in enumerate(pattern):
+        chunks.append(_tone_pcm(frequency_hz, duration_s))
+        if index < len(pattern) - 1:
+            chunks.append(_silence_pcm(0.07))
+
+    # Small tail of silence helps the final tone end cleanly.
+    chunks.append(_silence_pcm(0.10))
+    return np.concatenate(chunks).astype(np.int16, copy=False)
 
 
 def get_metered_ice_servers():
@@ -188,7 +241,7 @@ def get_metered_ice_servers():
       METERED_TURN_USERNAME = "..."
       METERED_TURN_CREDENTIAL = "..."
 
-    The free Metered TURN plan uses standard.relay.metered.ca.
+    The Global 500MB Metered TURN plan uses global.relay.metered.ca.
     """
     try:
         if "METERED_TURN_USERNAME" not in st.secrets:
@@ -207,22 +260,27 @@ def get_metered_ice_servers():
         ice_servers = [
             {"urls": "stun:stun.relay.metered.ca:80"},
             {
-                "urls": "turn:standard.relay.metered.ca:80",
+                "urls": "turn:global.relay.metered.ca:80",
                 "username": username,
                 "credential": credential,
             },
             {
-                "urls": "turn:standard.relay.metered.ca:80?transport=tcp",
+                "urls": "turn:global.relay.metered.ca:80?transport=tcp",
                 "username": username,
                 "credential": credential,
             },
             {
-                "urls": "turn:standard.relay.metered.ca:443",
+                "urls": "turn:global.relay.metered.ca:443",
                 "username": username,
                 "credential": credential,
             },
             {
-                "urls": "turn:standard.relay.metered.ca:443?transport=tcp",
+                "urls": "turn:global.relay.metered.ca:443?transport=tcp",
+                "username": username,
+                "credential": credential,
+            },
+            {
+                "urls": "turns:global.relay.metered.ca:443?transport=tcp",
                 "username": username,
                 "credential": credential,
             },
@@ -575,21 +633,10 @@ elif page == "Real-Time Monitoring":
     p4.metric("Mouth Ratio", "<= 1.50")
     p5.metric("Alarm Duration", "2.0 s")
 
-    if WINDOWS_SOUND_AVAILABLE:
-        sound_col1, sound_col2 = st.columns([3, 1])
-        with sound_col1:
-            st.success(
-                "Local Windows alarm sound is enabled. "
-                "Visual alerts remain active on all deployments."
-            )
-        with sound_col2:
-            if st.button("Test alarm sound"):
-                start_alarm_sound("FATIGUE")
-    else:
-        st.info(
-            "Server-side Windows alarm sound is unavailable on this host. "
-            "Visual fatigue alerts remain active."
-        )
+    st.success(
+        "🔊 Browser alarm audio is enabled. When fatigue is confirmed, "
+        "the warning tone is sent through WebRTC and plays on the visitor's device."
+    )
 
     metered_servers, metered_status = get_metered_ice_servers()
     if metered_servers:
@@ -617,14 +664,28 @@ elif page == "Real-Time Monitoring":
         )
     else:
         try:
-            from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+            from streamlit_webrtc import (
+                webrtc_streamer,
+                VideoProcessorBase,
+                create_pcm_audio_source_track,
+            )
             import av
             import mediapipe as mp
 
             eye_model, mouth_model = load_realtime_models()
 
+            # Server-generated audio is returned to the browser on the same
+            # WebRTC session. Silence is sent when no alarm is active.
+            browser_alarm_audio = create_pcm_audio_source_track(
+                key="fatigue-browser-alarm-audio",
+                sample_rate=ALARM_AUDIO_SAMPLE_RATE,
+                ptime=ALARM_AUDIO_PTIME,
+                lifecycle_scope="streamlit-session",
+            )
+
             class FatigueVideoProcessor(VideoProcessorBase):
-                def __init__(self):
+                def __init__(self, alarm_audio):
+                    self.alarm_audio = alarm_audio
                     self.face_mesh = mp.solutions.face_mesh.FaceMesh(
                         static_image_mode=False,
                         max_num_faces=1,
@@ -834,7 +895,19 @@ elif page == "Real-Time Monitoring":
                         )
 
                         if should_sound:
-                            start_alarm_sound(alarm_kind or "FATIGUE")
+                            try:
+                                self.alarm_audio.push(
+                                    make_browser_alarm_pcm(alarm_kind or "FATIGUE")
+                                )
+                            except Exception:
+                                # Audio must never interrupt fatigue detection.
+                                pass
+
+                            # Optional local Windows fallback when running the
+                            # dashboard directly on a Windows computer.
+                            if WINDOWS_SOUND_AVAILABLE:
+                                start_alarm_sound(alarm_kind or "FATIGUE")
+
                             self.last_alarm_sound_time = now
                             self.last_alarm_kind = alarm_kind
 
@@ -859,20 +932,45 @@ elif page == "Real-Time Monitoring":
 
                     return av.VideoFrame.from_ndarray(display, format="bgr24")
 
-            webrtc_streamer(
+            ctx = webrtc_streamer(
                 key="fatigue-monitor",
-                video_processor_factory=FatigueVideoProcessor,
+                video_processor_factory=lambda: FatigueVideoProcessor(
+                    browser_alarm_audio
+                ),
                 media_stream_constraints={
                     "video": {
                         "width": {"ideal": DISPLAY_WIDTH},
                         "height": {"ideal": DISPLAY_HEIGHT},
                         "frameRate": {"ideal": CAMERA_IDEAL_FPS, "max": 30},
                     },
+                    # We do not need the user's microphone.
                     "audio": False,
                 },
                 rtc_configuration=build_rtc_configuration(),
+                source_audio_track=browser_alarm_audio.track,
+                sendback_audio=True,
+                # Make the returned server-generated audio audible in-browser.
+                audio_html_attrs={
+                    "autoPlay": True,
+                    "controls": False,
+                    "muted": False,
+                },
                 async_processing=True,
             )
+
+            test_col1, test_col2 = st.columns([4, 1])
+            with test_col1:
+                st.caption(
+                    "Browser alarm sound is carried by the WebRTC audio track. "
+                    "If the browser blocks audio, interact with the page once "
+                    "(START already counts in most browsers) and check the tab/system volume."
+                )
+            with test_col2:
+                if st.button("🔊 Test browser alarm"):
+                    if ctx.state.playing:
+                        browser_alarm_audio.push(make_browser_alarm_pcm("FATIGUE"))
+                    else:
+                        st.warning("Start the camera first, then test the alarm.")
 
             st.caption(
                 "Camera frames are processed in memory for the live prototype; "
