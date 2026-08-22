@@ -952,7 +952,7 @@ elif page == "Real-Time Monitoring":
 
     storage_enabled = get_supabase_config() is not None
     if storage_enabled:
-        st.success("Research-data storage: ONLINE. Only non-video derived screening data will be saved.")
+        st.success("Research-data storage: CONFIGURED. Use Screening Records → diagnostics to verify database read/write access.")
     else:
         st.warning(
             "Research-data storage is not configured yet. Real-time detection still works, "
@@ -1474,7 +1474,13 @@ elif page == "Screening Records":
             elif records == []:
                 st.info("No screening records have been stored yet. Run a real-time screening session first.")
             else:
-                st.error("Unable to read screening records. Check the Supabase configuration and table setup.")
+                st.error("Unable to read screening records. The PIN is correct; the Supabase request failed.")
+                detail = get_last_db_error()
+                if detail:
+                    st.markdown("**Supabase returned:**")
+                    st.code(detail, language="text")
+                with st.expander("Supabase connection diagnostics", expanded=True):
+                    render_supabase_diagnostics()
 
 elif page == "Raw Data":
     st.subheader("Raw Non-Video Screening Data")
@@ -1536,7 +1542,13 @@ elif page == "Raw Data":
             elif rows == []:
                 st.info("No raw screening data have been stored yet.")
             else:
-                st.error("Unable to read raw data. Check the Supabase configuration and table setup.")
+                st.error("Unable to read raw data. The PIN is correct; the Supabase request failed.")
+                detail = get_last_db_error()
+                if detail:
+                    st.markdown("**Supabase returned:**")
+                    st.code(detail, language="text")
+                with st.expander("Supabase connection diagnostics", expanded=True):
+                    render_supabase_diagnostics()
 
 elif page == "Model Performance":
     st.subheader("Local CNN and Traditional Machine-Learning Performance")
