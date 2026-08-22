@@ -605,11 +605,15 @@ def _supabase_request(table, method="GET", payload=None, query=""):
     if query:
         endpoint += "?" + query.lstrip("?")
 
+    # New Supabase secret keys (sb_secret_...) are NOT JWTs and must be
+    # sent via the apikey header only. Legacy service_role JWT keys can
+    # still use both apikey and Authorization: Bearer.
     headers = {
         "apikey": config["key"],
-        "Authorization": f"Bearer {config['key']}",
         "Content-Type": "application/json",
     }
+    if not config["key"].startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {config['key']}"
 
     body = None
     if payload is not None:
@@ -651,10 +655,11 @@ def _write_screening_sample(session_record, raw_record):
     endpoint = f"{config['url']}/rest/v1/screening_sessions?on_conflict=session_id"
     headers = {
         "apikey": config["key"],
-        "Authorization": f"Bearer {config['key']}",
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
+    if not config["key"].startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {config['key']}"
     try:
         req = Request(
             endpoint,
