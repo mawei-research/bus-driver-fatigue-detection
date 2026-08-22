@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import json
+import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -581,12 +582,50 @@ def _secret(name, default=""):
 
 
 def get_supabase_config():
-    """Return server-side Supabase credentials from Streamlit Secrets."""
-    url = _secret("SUPABASE_URL").rstrip("/")
-    key = _secret("SUPABASE_SERVICE_ROLE_KEY")
+    """Return normalized server-side Supabase credentials from Streamlit Secrets."""
+    url = _secret("SUPABASE_URL").strip().rstrip("/")
+    key = _secret("SUPABASE_SERVICE_ROLE_KEY").strip()
+
+    # Accept either the project root URL or a copied Data API URL.
+    # Normalize everything to https://<project-ref>.supabase.co
+    for suffix in ("/rest/v1", "/rest/v1/"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)].rstrip("/")
+
     if not url or not key:
         return None
     return {"url": url, "key": key}
+
+
+_DB_ERROR_LOCK = threading.Lock()
+_DB_LAST_ERROR = ""
+
+
+def _sanitize_db_error(message):
+    """Remove any accidental secret-like value before showing diagnostics in the UI."""
+    if not message:
+        return ""
+    config = get_supabase_config()
+    if config and config.get("key"):
+        message = str(message).replace(config["key"], "[REDACTED_KEY]")
+    # Defensive masking for Supabase key formats if a backend echoes them.
+    message = re.sub(r"sb_(?:secret|publishable)_[A-Za-z0-9._-]+", "[REDACTED_KEY]", str(message))
+    return message[:2000]
+
+
+def _set_db_error(message):
+    global _DB_LAST_ERROR
+    with _DB_ERROR_LOCK:
+        _DB_LAST_ERROR = _sanitize_db_error(message)
+
+
+def get_last_db_error():
+    with _DB_ERROR_LOCK:
+        return _DB_LAST_ERROR
+
+
+def _clear_db_error():
+    _set_db_error("")
 
 
 @st.cache_resource
@@ -595,44 +634,83 @@ def get_db_executor():
     return ThreadPoolExecutor(max_workers=1, thread_name_prefix="fatigue-db")
 
 
+def _supabase_headers(config, prefer=None):
+    """Build headers for both modern sb_secret_* keys and legacy service_role JWTs."""
+    headers = {
+        "apikey": config["key"],
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "bus-driver-fatigue-dashboard/1.0",
+    }
+    # Modern secret keys are opaque API keys, not JWTs.
+    if not config["key"].startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {config['key']}"
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _http_error_detail(exc):
+    status = getattr(exc, "code", None)
+    reason = getattr(exc, "reason", None)
+    body = ""
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    parts = []
+    if status is not None:
+        parts.append(f"HTTP {status}")
+    if reason:
+        parts.append(str(reason))
+    if body:
+        parts.append(body)
+    return " | ".join(parts) or f"{type(exc).__name__}: {exc}"
+
+
 def _supabase_request(table, method="GET", payload=None, query=""):
-    """Small dependency-free Supabase REST client used only on the Streamlit server."""
+    """Small dependency-free Supabase REST client with safe diagnostics."""
     config = get_supabase_config()
     if config is None:
+        _set_db_error("Supabase credentials are missing from Streamlit Secrets.")
+        return None
+
+    if config["key"].startswith("sb_publishable_"):
+        _set_db_error(
+            "The configured key is a publishable key. Use the Supabase Secret key (sb_secret_...) "
+            "for server-side research-data access."
+        )
         return None
 
     endpoint = f"{config['url']}/rest/v1/{table}"
     if query:
         endpoint += "?" + query.lstrip("?")
 
-    # New Supabase secret keys (sb_secret_...) are NOT JWTs and must be
-    # sent via the apikey header only. Legacy service_role JWT keys can
-    # still use both apikey and Authorization: Bearer.
-    headers = {
-        "apikey": config["key"],
-        "Content-Type": "application/json",
-    }
-    if not config["key"].startswith("sb_secret_"):
-        headers["Authorization"] = f"Bearer {config['key']}"
-
+    headers = _supabase_headers(config)
     body = None
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
 
     req = Request(endpoint, data=body, headers=headers, method=method)
     try:
-        with urlopen(req, timeout=8) as response:
-            raw = response.read().decode("utf-8")
+        with urlopen(req, timeout=10) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            _clear_db_error()
             if not raw:
                 return True
             try:
                 return json.loads(raw)
             except json.JSONDecodeError:
                 return raw
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        # Data logging must never interrupt fatigue detection.
-        # Keep the error compact and server-side only.
-        print(f"[Research data storage] {type(exc).__name__}: {exc}")
+    except HTTPError as exc:
+        detail = _http_error_detail(exc)
+        _set_db_error(detail)
+        print(f"[Research data storage] {detail}")
+        return None
+    except (URLError, TimeoutError, OSError) as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        _set_db_error(detail)
+        print(f"[Research data storage] {detail}")
         return None
 
 
@@ -653,13 +731,14 @@ def _write_screening_sample(session_record, raw_record):
 
     # Upsert session summary first so the foreign-key target always exists.
     endpoint = f"{config['url']}/rest/v1/screening_sessions?on_conflict=session_id"
-    headers = {
-        "apikey": config["key"],
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=minimal",
-    }
-    if not config["key"].startswith("sb_secret_"):
-        headers["Authorization"] = f"Bearer {config['key']}"
+    if config["key"].startswith("sb_publishable_"):
+        _set_db_error("A publishable key is configured. Use the server-side sb_secret_... key instead.")
+        return False
+
+    headers = _supabase_headers(
+        config,
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
     try:
         req = Request(
             endpoint,
@@ -667,10 +746,18 @@ def _write_screening_sample(session_record, raw_record):
             headers=headers,
             method="POST",
         )
-        with urlopen(req, timeout=8) as response:
+        with urlopen(req, timeout=10) as response:
             response.read()
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        print(f"[Session upsert] {type(exc).__name__}: {exc}")
+        _clear_db_error()
+    except HTTPError as exc:
+        detail = _http_error_detail(exc)
+        _set_db_error(f"Session upsert failed: {detail}")
+        print(f"[Session upsert] {detail}")
+        return False
+    except (URLError, TimeoutError, OSError) as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        _set_db_error(f"Session upsert failed: {detail}")
+        print(f"[Session upsert] {detail}")
         return False
 
     endpoint = f"{config['url']}/rest/v1/fatigue_raw_data"
@@ -682,11 +769,19 @@ def _write_screening_sample(session_record, raw_record):
             headers=headers,
             method="POST",
         )
-        with urlopen(req, timeout=8) as response:
+        with urlopen(req, timeout=10) as response:
             response.read()
+        _clear_db_error()
         return True
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        print(f"[Raw data insert] {type(exc).__name__}: {exc}")
+    except HTTPError as exc:
+        detail = _http_error_detail(exc)
+        _set_db_error(f"Raw data insert failed: {detail}")
+        print(f"[Raw data insert] {detail}")
+        return False
+    except (URLError, TimeoutError, OSError) as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        _set_db_error(f"Raw data insert failed: {detail}")
+        print(f"[Raw data insert] {detail}")
         return False
 
 
@@ -707,6 +802,32 @@ def new_screening_session_id():
 
 def utc_iso_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def render_supabase_diagnostics():
+    """Show a safe connection test without exposing credentials."""
+    config = get_supabase_config()
+    if config is None:
+        st.error("Supabase Secrets are incomplete.")
+        return
+
+    key_type = (
+        "Secret key (sb_secret_...)" if config["key"].startswith("sb_secret_")
+        else "Publishable key (WRONG for this server-side page)" if config["key"].startswith("sb_publishable_")
+        else "Legacy JWT/service_role key"
+    )
+    st.caption(f"Supabase URL: {config['url']}")
+    st.caption(f"Configured key type: {key_type}")
+
+    if st.button("Test Supabase connection", key=f"test_supabase_{page}"):
+        test = supabase_select("screening_sessions", select="session_id", limit=1)
+        if isinstance(test, list):
+            st.success("Supabase connection test passed.")
+        else:
+            st.error("Supabase connection test failed.")
+            detail = get_last_db_error()
+            if detail:
+                st.code(detail, language="text")
 
 
 def require_data_admin_access():
