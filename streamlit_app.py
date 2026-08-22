@@ -1,7 +1,14 @@
 import os
 import time
 import threading
+import json
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import cv2
 import numpy as np
@@ -132,6 +139,8 @@ page = st.sidebar.radio(
     [
         "Overview",
         "Real-Time Monitoring",
+        "Screening Records",
+        "Raw Data",
         "Model Performance",
         "Video-Level Evaluation",
         "Geometric Filtering",
@@ -147,7 +156,7 @@ st.sidebar.caption("Machine Learning-Based Pre-Departure Fatigue Detection for B
 st.sidebar.markdown(f"[Open GitHub Repository]({GITHUB_BASE})")
 
 st.markdown('<div class="dashboard-title">Bus Driver Fatigue Detection Dashboard</div>', unsafe_allow_html=True)
-st.markdown('<div class="dashboard-subtitle">Experimental results and real-time prototype monitoring.</div>', unsafe_allow_html=True)
+st.markdown('<div class="dashboard-subtitle">Experimental results, real-time fatigue screening, and research-data access.</div>', unsafe_allow_html=True)
 
 # ============================================================
 # REAL-TIME MONITORING HELPERS
@@ -170,6 +179,12 @@ FRAME_STEP = 2
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
 CAMERA_IDEAL_FPS = 24
+
+# Research-data logging settings.
+# No video frames are stored. Only derived non-video screening measurements are saved.
+DATA_LOG_INTERVAL_SECONDS = 1.0
+RAW_DATA_DISPLAY_LIMIT = 5000
+SESSION_DISPLAY_LIMIT = 500
 
 # Browser alarm audio settings.
 # The alarm is sent back through the same WebRTC connection so it plays
@@ -553,6 +568,160 @@ def start_alarm_sound(alarm_kind="FATIGUE"):
     ).start()
 
 
+# ============================================================
+# OPTIONAL ONLINE RESEARCH-DATA STORAGE (SUPABASE REST API)
+# ============================================================
+def _secret(name, default=""):
+    """Read a Streamlit secret without exposing it in the UI or logs."""
+    try:
+        value = st.secrets.get(name, default)
+        return str(value).strip() if value is not None else default
+    except Exception:
+        return default
+
+
+def get_supabase_config():
+    """Return server-side Supabase credentials from Streamlit Secrets."""
+    url = _secret("SUPABASE_URL").rstrip("/")
+    key = _secret("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        return None
+    return {"url": url, "key": key}
+
+
+@st.cache_resource
+def get_db_executor():
+    # A single background worker keeps network/database writes out of the video thread.
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="fatigue-db")
+
+
+def _supabase_request(table, method="GET", payload=None, query=""):
+    """Small dependency-free Supabase REST client used only on the Streamlit server."""
+    config = get_supabase_config()
+    if config is None:
+        return None
+
+    endpoint = f"{config['url']}/rest/v1/{table}"
+    if query:
+        endpoint += "?" + query.lstrip("?")
+
+    headers = {
+        "apikey": config["key"],
+        "Authorization": f"Bearer {config['key']}",
+        "Content-Type": "application/json",
+    }
+
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+
+    req = Request(endpoint, data=body, headers=headers, method=method)
+    try:
+        with urlopen(req, timeout=8) as response:
+            raw = response.read().decode("utf-8")
+            if not raw:
+                return True
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        # Data logging must never interrupt fatigue detection.
+        # Keep the error compact and server-side only.
+        print(f"[Research data storage] {type(exc).__name__}: {exc}")
+        return None
+
+
+def supabase_select(table, select="*", order=None, limit=None):
+    params = [f"select={quote(select, safe='*,()')}" ]
+    if order:
+        params.append(f"order={quote(order, safe='.,')}")
+    if limit:
+        params.append(f"limit={int(limit)}")
+    return _supabase_request(table, method="GET", query="&".join(params))
+
+
+def _write_screening_sample(session_record, raw_record):
+    """Upsert the session summary, then append one raw non-video measurement row."""
+    config = get_supabase_config()
+    if config is None:
+        return False
+
+    # Upsert session summary first so the foreign-key target always exists.
+    endpoint = f"{config['url']}/rest/v1/screening_sessions?on_conflict=session_id"
+    headers = {
+        "apikey": config["key"],
+        "Authorization": f"Bearer {config['key']}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+    try:
+        req = Request(
+            endpoint,
+            data=json.dumps(session_record).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urlopen(req, timeout=8) as response:
+            response.read()
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        print(f"[Session upsert] {type(exc).__name__}: {exc}")
+        return False
+
+    endpoint = f"{config['url']}/rest/v1/fatigue_raw_data"
+    headers["Prefer"] = "return=minimal"
+    try:
+        req = Request(
+            endpoint,
+            data=json.dumps(raw_record).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urlopen(req, timeout=8) as response:
+            response.read()
+        return True
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        print(f"[Raw data insert] {type(exc).__name__}: {exc}")
+        return False
+
+
+def submit_screening_sample(session_record, raw_record):
+    """Queue a non-blocking storage write from the WebRTC processing thread."""
+    if get_supabase_config() is None:
+        return
+    try:
+        get_db_executor().submit(_write_screening_sample, session_record, raw_record)
+    except Exception as exc:
+        print(f"[Research data queue] {type(exc).__name__}: {exc}")
+
+
+def new_screening_session_id():
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"S{stamp}-{uuid.uuid4().hex[:6].upper()}"
+
+
+def utc_iso_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def require_data_admin_access():
+    """Protect stored research data from casual public dashboard visitors."""
+    configured_pin = _secret("DATA_ADMIN_PIN")
+    if not configured_pin:
+        st.warning(
+            "Stored research-data pages are disabled until DATA_ADMIN_PIN is added "
+            "to Streamlit Secrets. This prevents public visitors from viewing driver records."
+        )
+        return False
+
+    entered = st.text_input("Research data access PIN", type="password", key=f"pin_{page}")
+    if entered == configured_pin:
+        return True
+    if entered:
+        st.error("Incorrect access PIN.")
+    return False
+
+
 @st.cache_resource(show_spinner="Loading eye and mouth CNN models...")
 def load_realtime_models():
     import tensorflow as tf
@@ -617,6 +786,13 @@ if page == "Overview":
         width="stretch",
     )
 
+    st.markdown("### Research Data Handling")
+    st.info(
+        "For the online proof-of-concept, webcam frames are processed temporarily in memory and are not stored. "
+        "When online storage is configured, only derived non-video measurements and screening outcomes are saved "
+        "for later research analysis."
+    )
+
 elif page == "Real-Time Monitoring":
     st.subheader("Real-Time Fatigue Monitoring")
     st.markdown(
@@ -625,6 +801,37 @@ elif page == "Real-Time Monitoring":
         "MediaPipe Face Mesh, the two trained 2D-CNN models, geometric filtering, "
         "and actual-time duration judgement."
     )
+
+    st.markdown("### Screening Session")
+    if "screening_session_id" not in st.session_state:
+        st.session_state.screening_session_id = new_screening_session_id()
+        st.session_state.screening_started_at = utc_iso_now()
+
+    s1, s2 = st.columns([3, 1])
+    with s1:
+        driver_id = st.text_input(
+            "Driver ID / Screening Code",
+            value=st.session_state.get("driver_id", "Driver_001"),
+            help="Use a coded/non-identifying driver ID for research testing.",
+        ).strip() or "Driver_001"
+        st.session_state.driver_id = driver_id
+        st.caption(f"Session ID: {st.session_state.screening_session_id}")
+    with s2:
+        st.write("")
+        st.write("")
+        if st.button("New Screening Session", use_container_width=True):
+            st.session_state.screening_session_id = new_screening_session_id()
+            st.session_state.screening_started_at = utc_iso_now()
+            st.rerun()
+
+    storage_enabled = get_supabase_config() is not None
+    if storage_enabled:
+        st.success("Research-data storage: ONLINE. Only non-video derived screening data will be saved.")
+    else:
+        st.warning(
+            "Research-data storage is not configured yet. Real-time detection still works, "
+            "but screening records will not be saved until Supabase Secrets are added."
+        )
 
     p1, p2, p3, p4, p5 = st.columns(5)
     p1.metric("FrameStep", "2")
@@ -684,8 +891,11 @@ elif page == "Real-Time Monitoring":
             )
 
             class FatigueVideoProcessor(VideoProcessorBase):
-                def __init__(self, alarm_audio):
+                def __init__(self, alarm_audio, session_id, driver_code, started_at):
                     self.alarm_audio = alarm_audio
+                    self.session_id = session_id
+                    self.driver_id = driver_code
+                    self.started_at = started_at
                     self.face_mesh = mp.solutions.face_mesh.FaceMesh(
                         static_image_mode=False,
                         max_num_faces=1,
@@ -700,6 +910,15 @@ elif page == "Real-Time Monitoring":
                     self.alarm_active = False
                     self.last_alarm_sound_time = 0.0
                     self.last_alarm_kind = None
+
+                    # Research-data summary state. These counters are non-video metadata only.
+                    self.last_data_log_time = 0.0
+                    self.fatigue_risk_detected = False
+                    self.fatigue_alert_count = 0
+                    self.eye_alert_count = 0
+                    self.yawn_alert_count = 0
+                    self.max_eye_closure = 0.0
+                    self.max_yawn_duration = 0.0
 
                     self.face_detected = False
                     self.left_prob = None
@@ -744,6 +963,54 @@ elif page == "Real-Time Monitoring":
                         yawn_duration = max(0.0, now - self.yawn_start)
 
                     return closed_duration, yawn_duration
+
+                def _queue_research_data(self, now, closed_duration, yawn_duration, alarm_text, alarm_kind, force=False):
+                    self.max_eye_closure = max(self.max_eye_closure, float(closed_duration))
+                    self.max_yawn_duration = max(self.max_yawn_duration, float(yawn_duration))
+
+                    # Log approximately once per second, plus immediately when an alarm is active.
+                    if (now - self.last_data_log_time) < DATA_LOG_INTERVAL_SECONDS and not force:
+                        return
+                    self.last_data_log_time = now
+
+                    timestamp = utc_iso_now()
+                    screening_result = "FATIGUE RISK" if self.fatigue_risk_detected else "NORMAL"
+
+                    session_record = {
+                        "session_id": self.session_id,
+                        "driver_id": self.driver_id,
+                        "started_at": self.started_at,
+                        "last_seen_at": timestamp,
+                        "screening_result": screening_result,
+                        "fatigue_alerts": int(self.fatigue_alert_count),
+                        "eye_alerts": int(self.eye_alert_count),
+                        "yawn_alerts": int(self.yawn_alert_count),
+                        "max_eye_closure_seconds": round(self.max_eye_closure, 4),
+                        "max_yawn_seconds": round(self.max_yawn_duration, 4),
+                        "last_eye_state": self.eye_status,
+                        "last_mouth_state": self.mouth_status,
+                        "updated_at": timestamp,
+                    }
+
+                    raw_record = {
+                        "session_id": self.session_id,
+                        "driver_id": self.driver_id,
+                        "timestamp": timestamp,
+                        "frame_index": int(self.frame_index),
+                        "face_detected": bool(self.face_detected),
+                        "left_eye_open_prob": None if self.left_prob is None else round(float(self.left_prob), 6),
+                        "right_eye_open_prob": None if self.right_prob is None else round(float(self.right_prob), 6),
+                        "eye_state": self.eye_status,
+                        "yawn_probability": None if self.yawn_prob is None else round(float(self.yawn_prob), 6),
+                        "mouth_ratio": None if self.mouth_ratio is None else round(float(self.mouth_ratio), 6),
+                        "mouth_state": self.mouth_status,
+                        "eye_closure_duration_seconds": round(float(closed_duration), 4),
+                        "yawn_duration_seconds": round(float(yawn_duration), 4),
+                        "fatigue_alert": bool(alarm_text),
+                        "alert_type": alarm_kind,
+                        "screening_result": screening_result,
+                    }
+                    submit_screening_sample(session_record, raw_record)
 
                 def recv(self, frame):
                     raw = frame.to_ndarray(format="bgr24")
@@ -886,7 +1153,19 @@ elif page == "Real-Time Monitoring":
                         alarm_text = "WARNING: PROLONGED YAWNING"
                         alarm_kind = "YAWN"
 
+                    is_new_alarm_event = False
                     if alarm_text:
+                        is_new_alarm_event = (
+                            not self.alarm_active or self.last_alarm_kind != alarm_kind
+                        )
+                        if is_new_alarm_event:
+                            self.fatigue_risk_detected = True
+                            self.fatigue_alert_count += 1
+                            if alarm_kind == "EYE":
+                                self.eye_alert_count += 1
+                            elif alarm_kind == "YAWN":
+                                self.yawn_alert_count += 1
+
                         should_sound = (
                             not self.alarm_active
                             or self.last_alarm_kind != alarm_kind
@@ -916,6 +1195,16 @@ elif page == "Real-Time Monitoring":
                         self.alarm_active = False
                         self.last_alarm_kind = None
 
+                    # Persist derived non-video measurements only; webcam frames are never saved.
+                    self._queue_research_data(
+                        now,
+                        closed_duration,
+                        yawn_duration,
+                        alarm_text,
+                        alarm_kind,
+                        force=is_new_alarm_event,
+                    )
+
                     display = draw_hud_panel(
                         img,
                         self.face_detected,
@@ -935,7 +1224,10 @@ elif page == "Real-Time Monitoring":
             ctx = webrtc_streamer(
                 key="fatigue-monitor",
                 video_processor_factory=lambda: FatigueVideoProcessor(
-                    browser_alarm_audio
+                    browser_alarm_audio,
+                    st.session_state.screening_session_id,
+                    driver_id,
+                    st.session_state.screening_started_at,
                 ),
                 media_stream_constraints={
                     "video": {
@@ -973,8 +1265,9 @@ elif page == "Real-Time Monitoring":
                         st.warning("Start the camera first, then test the alarm.")
 
             st.caption(
-                "Camera frames are processed in memory for the live prototype; "
-                "no webcam recording is saved. MediaPipe/CNN inference runs every "
+                "Camera frames are processed in memory for the live prototype; no webcam recording is saved. "
+                "When research-data storage is enabled, only non-video derived measurements and screening results are stored. "
+                "MediaPipe/CNN inference runs every "
                 "other frame (FrameStep = 2), while the 2.0-second decision uses "
                 "actual elapsed time."
             )
@@ -988,6 +1281,121 @@ elif page == "Real-Time Monitoring":
             )
         except Exception as exc:
             st.exception(exc)
+
+elif page == "Screening Records":
+    st.subheader("Screening Records")
+    st.markdown(
+        "This page shows one summary row per screening session. No webcam video is stored. "
+        "Use coded driver IDs rather than personal names."
+    )
+
+    if require_data_admin_access():
+        if get_supabase_config() is None:
+            st.error("Supabase storage is not configured in Streamlit Secrets.")
+        else:
+            records = supabase_select(
+                "screening_sessions",
+                select="*",
+                order="started_at.desc",
+                limit=SESSION_DISPLAY_LIMIT,
+            )
+            if isinstance(records, list) and records:
+                df = pd.DataFrame(records)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Sessions", len(df))
+                c2.metric("Drivers", df["driver_id"].nunique() if "driver_id" in df else "-")
+                risk_count = int((df.get("screening_result", pd.Series(dtype=str)) == "FATIGUE RISK").sum())
+                c3.metric("Fatigue-Risk Sessions", risk_count)
+                c4.metric("Normal Sessions", max(len(df) - risk_count, 0))
+
+                driver_options = ["All"] + sorted(df["driver_id"].dropna().astype(str).unique().tolist())
+                selected_driver = st.selectbox("Filter by Driver ID", driver_options)
+                shown = df if selected_driver == "All" else df[df["driver_id"].astype(str) == selected_driver]
+
+                preferred = [
+                    "started_at", "driver_id", "session_id", "screening_result",
+                    "fatigue_alerts", "eye_alerts", "yawn_alerts",
+                    "max_eye_closure_seconds", "max_yawn_seconds",
+                    "last_eye_state", "last_mouth_state", "last_seen_at",
+                ]
+                cols = [c for c in preferred if c in shown.columns]
+                st.dataframe(shown[cols], width="stretch", hide_index=True)
+                st.download_button(
+                    "Download Screening Records (.CSV)",
+                    shown[cols].to_csv(index=False).encode("utf-8-sig"),
+                    file_name="screening_records.csv",
+                    mime="text/csv",
+                )
+                st.info(
+                    "Recommended action for a FATIGUE RISK result: the driver should rest and be re-screened before departure; "
+                    "further assessment may be arranged according to operational policy. This prototype is not a medical diagnosis."
+                )
+            elif records == []:
+                st.info("No screening records have been stored yet. Run a real-time screening session first.")
+            else:
+                st.error("Unable to read screening records. Check the Supabase configuration and table setup.")
+
+elif page == "Raw Data":
+    st.subheader("Raw Non-Video Screening Data")
+    st.markdown(
+        "This page provides the derived research measurements requested for proof-of-concept analysis. "
+        "The system does **not** store webcam video or images."
+    )
+
+    if require_data_admin_access():
+        if get_supabase_config() is None:
+            st.error("Supabase storage is not configured in Streamlit Secrets.")
+        else:
+            rows = supabase_select(
+                "fatigue_raw_data",
+                select="*",
+                order="timestamp.desc",
+                limit=RAW_DATA_DISPLAY_LIMIT,
+            )
+            if isinstance(rows, list) and rows:
+                df = pd.DataFrame(rows)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Rows Loaded", len(df))
+                c2.metric("Sessions", df["session_id"].nunique() if "session_id" in df else "-")
+                c3.metric("Fatigue-Alert Rows", int(df.get("fatigue_alert", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()))
+
+                f1, f2 = st.columns(2)
+                with f1:
+                    driver_options = ["All"] + sorted(df["driver_id"].dropna().astype(str).unique().tolist())
+                    selected_driver = st.selectbox("Driver ID", driver_options, key="raw_driver")
+                with f2:
+                    session_options = ["All"] + sorted(df["session_id"].dropna().astype(str).unique().tolist())
+                    selected_session = st.selectbox("Session ID", session_options, key="raw_session")
+
+                shown = df.copy()
+                if selected_driver != "All":
+                    shown = shown[shown["driver_id"].astype(str) == selected_driver]
+                if selected_session != "All":
+                    shown = shown[shown["session_id"].astype(str) == selected_session]
+
+                preferred = [
+                    "timestamp", "driver_id", "session_id", "frame_index", "face_detected",
+                    "left_eye_open_prob", "right_eye_open_prob", "eye_state",
+                    "yawn_probability", "mouth_ratio", "mouth_state",
+                    "eye_closure_duration_seconds", "yawn_duration_seconds",
+                    "fatigue_alert", "alert_type", "screening_result",
+                ]
+                cols = [c for c in preferred if c in shown.columns]
+                st.dataframe(shown[cols], width="stretch", hide_index=True)
+                st.download_button(
+                    "Download Raw Data (.CSV)",
+                    shown[cols].to_csv(index=False).encode("utf-8-sig"),
+                    file_name="fatigue_raw_data.csv",
+                    mime="text/csv",
+                )
+                st.caption(
+                    "Raw here means model-derived, non-video screening measurements. "
+                    "Camera frames are processed temporarily and are not retained."
+                )
+            elif rows == []:
+                st.info("No raw screening data have been stored yet.")
+            else:
+                st.error("Unable to read raw data. Check the Supabase configuration and table setup.")
 
 elif page == "Model Performance":
     st.subheader("Local CNN and Traditional Machine-Learning Performance")
@@ -1061,6 +1469,7 @@ elif page == "Research Questions":
 elif page == "Code & Resources":
     st.subheader("Source Code and Research Resources")
     resources = [
+        ("Online Dashboard", "https://bus-driver-fatigue-detection-42tnvkqzbn6skdbp4z74gf.streamlit.app/"),
         ("Complete Source Code Repository", GITHUB_BASE),
         ("Eye-State CNN Training", f"{GITHUB_BASE}/blob/main/train_2d_cnn_eyes.py"),
         ("Mouth-State CNN Training", f"{GITHUB_BASE}/blob/main/train_2d_cnn_mouth.py"),
