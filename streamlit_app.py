@@ -1221,13 +1221,28 @@ elif page == "Real-Time Monitoring":
 
                     return av.VideoFrame.from_ndarray(display, format="bgr24")
 
+            # Capture Streamlit session values on the main script thread BEFORE
+            # streamlit-webrtc creates its worker thread. The processor factory may
+            # run outside Streamlit's ScriptRunContext, so it must not access
+            # st.session_state directly.
+            current_session_id = st.session_state.get("screening_session_id")
+            current_started_at = st.session_state.get("screening_started_at")
+            current_driver_id = driver_id
+
+            if not current_session_id:
+                current_session_id = new_screening_session_id()
+                st.session_state.screening_session_id = current_session_id
+            if not current_started_at:
+                current_started_at = utc_iso_now()
+                st.session_state.screening_started_at = current_started_at
+
             ctx = webrtc_streamer(
                 key="fatigue-monitor",
                 video_processor_factory=lambda: FatigueVideoProcessor(
                     browser_alarm_audio,
-                    st.session_state.screening_session_id,
-                    driver_id,
-                    st.session_state.screening_started_at,
+                    current_session_id,
+                    current_driver_id,
+                    current_started_at,
                 ),
                 media_stream_constraints={
                     "video": {
